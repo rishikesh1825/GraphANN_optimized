@@ -11,6 +11,28 @@
 #include <vector>
 #include <cstdlib>
 
+// Windows-specific headers for memory tracking
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#endif
+
+/**
+ * Returns the current resident set size (RAM usage) of the process in MB.
+ */
+static double get_memory_usage() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+        return (double)pmc.PrivateUsage / (1024.0 * 1024.0);
+    }
+    return 0.0;
+#else
+    // Fallback for non-Windows environments
+    return 0.0; 
+#endif
+}
+
 static void print_usage(const char* prog) {
     std::cerr << "Usage: " << prog
               << " --index <index_path>"
@@ -22,7 +44,6 @@ static void print_usage(const char* prog) {
               << std::endl;
 }
 
-// Parse comma-separated L values like "10,20,50,100"
 static std::vector<uint32_t> parse_L_values(const std::string& s) {
     std::vector<uint32_t> values;
     std::istringstream stream(s);
@@ -34,7 +55,6 @@ static std::vector<uint32_t> parse_L_values(const std::string& s) {
     return values;
 }
 
-// Compute recall@K: fraction of true top-K neighbors found in result
 static double compute_recall(const std::vector<uint32_t>& result,
                              const uint32_t* gt, uint32_t K) {
     uint32_t found = 0;
@@ -74,86 +94,63 @@ int main(int argc, char** argv) {
     }
 
     std::vector<uint32_t> L_values = parse_L_values(L_str);
-    if (L_values.empty()) {
-        std::cerr << "Error: no L values provided." << std::endl;
-        return 1;
-    }
-
+    
     // --- Load index ---
     std::cout << "Loading index..." << std::endl;
     VamanaIndex index;
     index.load(index_path, data_path);
 
     // --- Load queries ---
-    std::cout << "Loading queries from " << query_path << "..." << std::endl;
     FloatMatrix queries = load_fbin(query_path);
-    std::cout << "  Queries: " << queries.npts << " x " << queries.dims << std::endl;
-
-    if (queries.dims != index.get_dim()) {
-        std::cerr << "Error: query dimension (" << queries.dims
-                  << ") != index dimension (" << index.get_dim() << ")" << std::endl;
-        return 1;
-    }
-
+    
     // --- Load ground truth ---
-    std::cout << "Loading ground truth from " << gt_path << "..." << std::endl;
     IntMatrix gt = load_ibin(gt_path);
-    std::cout << "  Ground truth: " << gt.npts << " x " << gt.dims << std::endl;
-
-    if (gt.npts != queries.npts) {
-        std::cerr << "Error: ground truth rows (" << gt.npts
-                  << ") != number of queries (" << queries.npts << ")" << std::endl;
-        return 1;
-    }
-    if (gt.dims < K) {
-        std::cerr << "Warning: ground truth has " << gt.dims
-                  << " neighbors per query but K=" << K << std::endl;
-        K = gt.dims;
-    }
 
     uint32_t nq = queries.npts;
 
     // --- Run search for each L value ---
-    std::cout << "\n=== Search Results (K=" << K << ") ===" << std::endl;
-    std::cout << std::setw(8) << "L"
-              << std::setw(14) << "Recall@" + std::to_string(K)
-              << std::setw(16) << "Avg Dist Cmps"
-              << std::setw(18) << "Avg Latency (us)"
-              << std::setw(18) << "P99 Latency (us)"
+    std::cout << "\n=== Vamana Performance Benchmark (K=" << K << ") ===" << std::endl;
+    std::cout << std::setw(6)  << "L"
+              << std::setw(12) << "Recall@K"
+              << std::setw(14) << "Avg Lat(us)"
+              << std::setw(14) << "P99 Lat(us)"
+              << std::setw(16) << "Batch Time(s)"
+              << std::setw(12) << "RAM (MB)"
               << std::endl;
     std::cout << std::string(74, '-') << std::endl;
 
     for (uint32_t L : L_values) {
         std::vector<double> recalls(nq);
-        std::vector<uint32_t> dist_cmps(nq);
         std::vector<double> latencies(nq);
 
+        Timer batch_timer; // Track total time for this batch
+
+        // Parallel search using OpenMP
         #pragma omp parallel for schedule(dynamic, 16)
         for (uint32_t q = 0; q < nq; q++) {
             SearchResult res = index.search(queries.row(q), K, L);
 
             recalls[q] = compute_recall(res.ids, gt.row(q), K);
-            dist_cmps[q] = res.dist_cmps;
             latencies[q] = res.latency_us;
         }
 
-        // Aggregate statistics
+        double total_batch_time = batch_timer.elapsed_seconds();
         double avg_recall = std::accumulate(recalls.begin(), recalls.end(), 0.0) / nq;
-        double avg_cmps = (double)std::accumulate(dist_cmps.begin(), dist_cmps.end(), 0ULL) / nq;
         double avg_lat = std::accumulate(latencies.begin(), latencies.end(), 0.0) / nq;
 
-        // P99 latency
+        // Calculate P99 Latency
         std::sort(latencies.begin(), latencies.end());
         double p99_lat = latencies[(size_t)(0.99 * nq)];
 
-        std::cout << std::setw(8) << L
-                  << std::setw(14) << std::fixed << std::setprecision(4) << avg_recall
-                  << std::setw(16) << std::fixed << std::setprecision(1) << avg_cmps
-                  << std::setw(18) << std::fixed << std::setprecision(1) << avg_lat
-                  << std::setw(18) << std::fixed << std::setprecision(1) << p99_lat
+        std::cout << std::setw(6)  << L
+                  << std::setw(12) << std::fixed << std::setprecision(4) << avg_recall
+                  << std::setw(14) << std::fixed << std::setprecision(1) << avg_lat
+                  << std::setw(14) << std::fixed << std::setprecision(1) << p99_lat
+                  << std::setw(16) << std::fixed << std::setprecision(3) << total_batch_time
+                  << std::setw(12) << std::fixed << std::setprecision(1) << get_memory_usage()
                   << std::endl;
     }
 
-    std::cout << "\nDone." << std::endl;
+    std::cout << "\nBenchmark complete." << std::endl;
     return 0;
 }

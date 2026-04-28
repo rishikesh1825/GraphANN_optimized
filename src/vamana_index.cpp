@@ -16,6 +16,64 @@
 // Destructor
 // ============================================================================
 
+// ============================================================================
+// Model 1: Thread-Local ATVB (Adaptive Timestamp Visited Buffer)
+// ============================================================================
+
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#endif
+
+// Returns memory usage in Megabytes (MB)
+double get_memory_usage() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc;
+    GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
+    return (double)pmc.PrivateUsage / (1024.0 * 1024.0);
+#else
+    // Basic Linux support
+    return 0.0; 
+#endif
+}
+
+
+struct ATVB {
+    std::vector<uint32_t> visit_id;
+    std::vector<float> best_dist;
+    uint32_t current_iter;
+
+    ATVB() : current_iter(0) {}
+
+    void init(size_t N) {
+        if (visit_id.size() != N) {
+            visit_id.assign(N, 0);
+            best_dist.assign(N, std::numeric_limits<float>::infinity());
+            current_iter = 0;
+        }
+    }
+
+    void reset() {
+        current_iter++;
+        if (current_iter == 0) { // overflow guard
+            std::fill(visit_id.begin(), visit_id.end(), 0);
+            current_iter = 1;
+        }
+    }
+
+    inline bool should_visit(uint32_t node, float dist, float eps = 0.01f) {
+        if (visit_id[node] != current_iter || dist < best_dist[node] - eps) {
+            visit_id[node] = current_iter;
+            best_dist[node] = dist;
+            return true;
+        }
+        return false;
+    }
+};
+
+// thread_local ensures every parallel worker gets its own persistent buffer without crashing!
+thread_local ATVB tl_vis_buf;
+
 VamanaIndex::~VamanaIndex() {
     if (owns_data_ && data_) {
         std::free(data_);
@@ -35,10 +93,11 @@ VamanaIndex::~VamanaIndex() {
 
 std::pair<std::vector<VamanaIndex::Candidate>, uint32_t>
 VamanaIndex::greedy_search(const float* query, uint32_t L) const {
-    // Candidate set: ordered by (distance, id). Bounded at size L.
     std::set<Candidate> candidate_set;
-    // Track which nodes we've already expanded (visited).
-    std::vector<bool> visited(npts_, false);
+    
+    // Initialize (only allocates once ever!) and reset O(1)
+    tl_vis_buf.init(npts_);
+    tl_vis_buf.reset();
 
     uint32_t dist_cmps = 0;
 
@@ -46,16 +105,11 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
     float start_dist = compute_l2sq(query, get_vector(start_node_), dim_);
     dist_cmps++;
     candidate_set.insert({start_dist, start_node_});
-    visited[start_node_] = true;
+    tl_vis_buf.should_visit(start_node_, start_dist);
 
-    // Track which candidates have been expanded (their neighbors explored).
-    // We iterate through candidate_set; entries before our "frontier" pointer
-    // have been expanded. We use a simple approach: keep scanning from the
-    // beginning of the set for the first un-expanded entry.
     std::set<uint32_t> expanded;
 
     while (true) {
-        // Find closest candidate that hasn't been expanded yet
         uint32_t best_node = UINT32_MAX;
         for (const auto& [dist, id] : candidate_set) {
             if (expanded.find(id) == expanded.end()) {
@@ -63,28 +117,31 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
                 break;
             }
         }
-        if (best_node == UINT32_MAX)
-            break;  // all candidates expanded
-
+        if (best_node == UINT32_MAX) break; 
+        
         expanded.insert(best_node);
 
-        // Expand: evaluate all neighbors of best_node
-        // Copy neighbor list under lock to avoid data race with parallel build
-        // (another thread might push_back / reallocate graph_[best_node]).
         std::vector<uint32_t> neighbors;
         {
             std::lock_guard<std::mutex> lock(locks_[best_node]);
             neighbors = graph_[best_node];
         }
-        for (uint32_t nbr : neighbors) {
-            if (visited[nbr])
-                continue;
-            visited[nbr] = true;
+        
+        for (size_t i = 0; i < neighbors.size(); i++) {
+            // OPTIMIZATION: Hardware Prefetch 3 steps ahead
+            if (i + 3 < neighbors.size()) {
+                __builtin_prefetch(get_vector(neighbors[i + 3]), 0, 3);
+            }
 
+            uint32_t nbr = neighbors[i];
+
+            // Calculate distance immediately
             float d = compute_l2sq(query, get_vector(nbr), dim_);
             dist_cmps++;
 
-            // Insert if candidate set isn't full or this is closer than worst
+            // ATVB: Check if visited OR if we found a better route
+            if (!tl_vis_buf.should_visit(nbr, d)) continue;
+
             if (candidate_set.size() < L) {
                 candidate_set.insert({d, nbr});
             } else {
@@ -97,7 +154,6 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
         }
     }
 
-    // Convert to sorted vector
     std::vector<Candidate> results(candidate_set.begin(), candidate_set.end());
     return {results, dist_cmps};
 }
