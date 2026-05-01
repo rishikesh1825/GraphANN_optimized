@@ -29,3 +29,5 @@ target_link_libraries(build_index PRIVATE graphann_lib)
 # Search index executable
 add_executable(search_index src/search_index.cpp)
 target_link_libraries(search_index PRIVATE graphann_lib)
+
+target_link_libraries(search_index PRIVATE psapi)

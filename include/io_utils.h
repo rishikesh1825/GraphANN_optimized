@@ -1,36 +1,41 @@
 #pragma once
-
-#include <cstdint>
+#include <vector>
 #include <string>
 #include <memory>
+#include <cstdint>
 
-// Reads a .fbin file: 4 bytes npts (uint32), 4 bytes dims (uint32),
-// then npts * dims floats in row-major order.
-// Returns aligned memory for SIMD-friendly access.
-// Caller receives ownership via unique_ptr with custom deleter.
+/**
+ * Global RAM tracking for baseline verification
+ */
+double get_memory_usage_mb();
+
 struct FloatMatrix {
-    std::unique_ptr<float[], void(*)(void*)> data;
     uint32_t npts;
     uint32_t dims;
+    // Managed pointer with custom deleter for aligned memory[cite: 4]
+    std::unique_ptr<float[], void(*)(void*)> data{nullptr, [](void*){}};
 
-    FloatMatrix() : data(nullptr, std::free), npts(0), dims(0) {}
-
-    const float* row(uint32_t i) const { return data.get() + (size_t)i * dims; }
-    float*       row(uint32_t i)       { return data.get() + (size_t)i * dims; }
+    inline float* get_row(uint32_t i) const { 
+        return data.get() + (size_t)i * dims; 
+    }
 };
 
-// Reads a .ibin file: same layout but with uint32_t entries.
-// Used for ground truth (top-K neighbor IDs per query).
 struct IntMatrix {
-    std::unique_ptr<uint32_t[], void(*)(void*)> data;
     uint32_t npts;
     uint32_t dims;
+    std::unique_ptr<uint32_t[], void(*)(void*)> data{nullptr, [](void*){}};
 
-    IntMatrix() : data(nullptr, std::free), npts(0), dims(0) {}
-
-    const uint32_t* row(uint32_t i) const { return data.get() + (size_t)i * dims; }
-    uint32_t*       row(uint32_t i)       { return data.get() + (size_t)i * dims; }
+    inline uint32_t* get_row(uint32_t i) const { 
+        return data.get() + (size_t)i * dims; 
+    }
 };
 
+// Data Loaders for SIFTIM Dataset[cite: 1, 4]
+FloatMatrix load_fvecs(const std::string& path);
 FloatMatrix load_fbin(const std::string& path);
-IntMatrix   load_ibin(const std::string& path);
+IntMatrix load_ibin(const std::string& path);
+std::vector<std::vector<uint32_t>> load_ivecs(const std::string& path);
+
+// Memory Utilities
+void* aligned_alloc_wrapper(size_t size);
+void aligned_free_wrapper(void* ptr);
