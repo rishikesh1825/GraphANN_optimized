@@ -15,46 +15,13 @@
 #endif
 
 // ============================================================================
-// Thread-local visited buffer
-// ============================================================================
-struct ATVB {
-    std::vector<uint32_t> visit_id;
-    std::vector<float> best_dist;
-    uint32_t current_iter;
-    ATVB() : current_iter(0) {}
-    void init(size_t N) {
-        if (visit_id.size() != N) {
-            visit_id.assign(N, 0);
-            best_dist.assign(N, std::numeric_limits<float>::infinity());
-            current_iter = 0;
-        }
-    }
-    void reset() {
-        current_iter++;
-        if (current_iter == 0) { 
-            std::fill(visit_id.begin(), visit_id.end(), 0); 
-            current_iter = 1; 
-        }
-    }
-    inline bool should_visit(uint32_t node, float dist) {
-        if (visit_id[node] != current_iter || dist < best_dist[node]) {
-            visit_id[node] = current_iter;
-            best_dist[node] = dist;
-            return true;
-        }
-        return false;
-    }
-};
-thread_local ATVB tl_vis_buf;
-
-// ============================================================================
 // Lifecycle
 // ============================================================================
-VamanaIndex::VamanaIndex() : data_(nullptr), u8_data_(nullptr), owns_data_(false), npts_(0), dim_(0), start_node_(0) {}
+VamanaIndex::VamanaIndex() : data_(nullptr), u8_data_(nullptr), owns_data_(false), npts_(0), dim_(0), start_node_(0), pq_M_(0), locks_(nullptr) {}
 
 VamanaIndex::~VamanaIndex() {
     if (owns_data_ && data_) delete[] data_;
-    if (u8_data_) _aligned_free(u8_data_); // Clean up aligned SQ8 buffer
+    if (u8_data_) _aligned_free(u8_data_); // Clean up SQ8 data
 }
 
 // ============================================================================
@@ -79,70 +46,41 @@ uint32_t VamanaIndex::calculate_medoid() {
 }
 
 void VamanaIndex::quantize_data() {
-    // 1. Calculate size carefully
     size_t total_elements = (size_t)npts_ * dim_;
-    std::cout << "  Allocating " << total_elements / (1024*1024) << " MB for SQ8 buffer..." << std::endl;
+    std::cout << "  Allocating " << total_elements / (1024*1024) << " MB for SQ8 Re-ranker..." << std::endl;
     
     if (u8_data_) _aligned_free(u8_data_);
     u8_data_ = (uint8_t*)_aligned_malloc(total_elements, 64);
     
-    if (u8_data_ == nullptr) {
-        throw std::runtime_error("OS refused to allocate SQ8 buffer - out of memory!");
-    }
+    if (u8_data_ == nullptr) throw std::runtime_error("Failed to allocate SQ8 buffer!");
 
-    // 2. USE SERIAL LOOP (No OpenMP) for stability during peak RAM
     for (size_t i = 0; i < total_elements; i++) {
         u8_data_[i] = (uint8_t)std::clamp((int)data_[i], 0, 255);
     }
-    std::cout << "  Quantization complete." << std::endl;
 }
 
 // ============================================================================
 // Search Engines
 // ============================================================================
-std::pair<std::vector<VamanaIndex::Candidate>, uint32_t> 
-VamanaIndex::greedy_search_u8(const uint8_t* query_u8, uint32_t L) const {
-    std::set<Candidate> candidate_set;
-    tl_vis_buf.init(npts_); tl_vis_buf.reset();
-    uint32_t dist_cmps = 0;
 
-    float start_dist = (float)compute_l2sq_u8(query_u8, u8_data_ + (size_t)start_node_ * dim_, dim_);
-    candidate_set.insert({start_dist, start_node_});
-    tl_vis_buf.should_visit(start_node_, start_dist);
-
-    std::set<uint32_t> expanded;
-    while (true) {
-        uint32_t best_node = UINT32_MAX;
-        for (const auto& cand : candidate_set) {
-            if (expanded.find(cand.second) == expanded.end()) { 
-                best_node = cand.second; 
-                break; 
-            }
-        }
-        if (best_node == UINT32_MAX) break;
-        expanded.insert(best_node);
-
-        for (uint32_t nbr : graph_[best_node]) {
-            __builtin_prefetch(u8_data_ + (size_t)nbr * dim_, 0, 3);
-            float d = (float)compute_l2sq_u8(query_u8, u8_data_ + (size_t)nbr * dim_, dim_);
-            dist_cmps++;
-
-            if (!tl_vis_buf.should_visit(nbr, d)) continue;
-            candidate_set.insert({d, nbr});
-            if (candidate_set.size() > L) candidate_set.erase(std::prev(candidate_set.end()));
-        }
-    }
-    return {std::vector<Candidate>(candidate_set.begin(), candidate_set.end()), dist_cmps};
-}
-
+// Internal search used ONLY during graph construction (uses high-precision floats)
 std::pair<std::vector<VamanaIndex::Candidate>, uint32_t> 
 VamanaIndex::greedy_search(const float* query, uint32_t L) const {
+    
+    int tid = 0;
+#ifdef _OPENMP
+    tid = omp_get_thread_num();
+#endif
+    ATVB& vis_buf = thread_buffers_[tid];
+    
     std::set<Candidate> candidate_set;
-    tl_vis_buf.init(npts_); tl_vis_buf.reset();
+    vis_buf.init(npts_); vis_buf.reset();
     uint32_t dist_cmps = 0;
+    
     float start_dist = compute_l2sq(query, get_vector(start_node_), dim_);
     candidate_set.insert({start_dist, start_node_});
-    tl_vis_buf.should_visit(start_node_, start_dist);
+    vis_buf.should_visit(start_node_, start_dist);
+    
     std::set<uint32_t> expanded;
     while (true) {
         uint32_t best_node = UINT32_MAX;
@@ -151,10 +89,19 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
         }
         if (best_node == UINT32_MAX) break;
         expanded.insert(best_node);
-        for (uint32_t nbr : graph_[best_node]) {
+        
+        std::vector<uint32_t> nbrs;
+        if (locks_) {
+            std::lock_guard<std::mutex> lock(locks_[best_node]);
+            nbrs = graph_[best_node];
+        } else {
+            nbrs = graph_[best_node]; 
+        }
+
+        for (uint32_t nbr : nbrs) {
             float d = compute_l2sq(query, get_vector(nbr), dim_);
             dist_cmps++;
-            if (!tl_vis_buf.should_visit(nbr, d)) continue;
+            if (!vis_buf.should_visit(nbr, d)) continue;
             candidate_set.insert({d, nbr});
             if (candidate_set.size() > L) candidate_set.erase(std::prev(candidate_set.end()));
         }
@@ -162,8 +109,86 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
     return {std::vector<Candidate>(candidate_set.begin(), candidate_set.end()), dist_cmps};
 }
 
+// The Two-Stage Product Quantization + SQ8 Re-ranker
+SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L) const {
+    Timer t;
+    
+    int tid = 0;
+#ifdef _OPENMP
+    tid = omp_get_thread_num();
+#endif
+    ATVB& vis_buf = thread_buffers_[tid];
+    
+    // STAGE 1 PREP: Precompute PQ LUT and quantize query to SQ8
+    std::vector<float> lut(pq_M_ * 256);
+    compute_pq_lut(query, pq_codebook_.data(), lut.data(), pq_M_, dim_);
+    
+    std::vector<uint8_t> q_u8(dim_);
+    for(uint32_t i=0; i<dim_; i++) q_u8[i] = (uint8_t)std::clamp((int)query[i], 0, 255);
+    
+    std::set<Candidate> candidate_set;
+    vis_buf.init(npts_); vis_buf.reset();
+    uint32_t dist_cmps = 0;
+
+    float start_dist = compute_adc_distance(lut.data(), pq_data_.data() + start_node_ * pq_M_, pq_M_);
+    candidate_set.insert({start_dist, start_node_});
+    vis_buf.should_visit(start_node_, start_dist);
+
+    std::set<uint32_t> expanded;
+    
+    // STAGE 1: Fast Graph Traversal using PQ
+    while (true) {
+        uint32_t best_node = UINT32_MAX;
+        for (const auto& cand : candidate_set) {
+            if (expanded.find(cand.second) == expanded.end()) { best_node = cand.second; break; }
+        }
+        if (best_node == UINT32_MAX) break;
+        expanded.insert(best_node);
+
+        std::vector<uint32_t> nbrs;
+        if (locks_) {
+            std::lock_guard<std::mutex> lock(locks_[best_node]);
+            nbrs = graph_[best_node];
+        } else {
+            nbrs = graph_[best_node]; 
+        }
+
+        for (uint32_t nbr : nbrs) {
+            __builtin_prefetch(pq_data_.data() + nbr * pq_M_, 0, 3);
+            float d = compute_adc_distance(lut.data(), pq_data_.data() + nbr * pq_M_, pq_M_);
+            dist_cmps++;
+
+            if (!vis_buf.should_visit(nbr, d)) continue;
+            candidate_set.insert({d, nbr});
+            if (candidate_set.size() > L) candidate_set.erase(std::prev(candidate_set.end()));
+        }
+    }
+    
+    // STAGE 2: Precision Re-ranking using SQ8
+    std::vector<Candidate> reranked_candidates;
+    reranked_candidates.reserve(candidate_set.size());
+    
+    for (const auto& cand : candidate_set) {
+        uint32_t node = cand.second;
+        // Compute the true SQ8 distance using AVX2 SIMD
+        float true_dist = (float)compute_l2sq_u8(q_u8.data(), u8_data_ + (size_t)node * dim_, dim_);
+        reranked_candidates.push_back({true_dist, node});
+    }
+    
+    // Re-sort the final L candidates based on their mathematically more precise distances
+    std::sort(reranked_candidates.begin(), reranked_candidates.end());
+    
+    SearchResult result;
+    result.dist_cmps = dist_cmps; 
+    result.latency_us = t.elapsed_us();
+    for (uint32_t i = 0; i < K && i < reranked_candidates.size(); i++) {
+        result.ids.push_back(reranked_candidates[i].second);
+    }
+    return result;
+}
+
 // ============================================================================
-// Core Vamana Logic
+// Core Vamana Logic (Build Phase)
 // ============================================================================
 void VamanaIndex::robust_prune(uint32_t p, std::vector<Candidate>& candidates, float alpha, uint32_t R) {
     std::vector<Candidate> current_candidates = candidates;
@@ -171,7 +196,10 @@ void VamanaIndex::robust_prune(uint32_t p, std::vector<Candidate>& candidates, f
         current_candidates.push_back({compute_l2sq(get_vector(p), get_vector(nbr), dim_), nbr});
     }
     std::sort(current_candidates.begin(), current_candidates.end());
+    
     std::vector<uint32_t> new_neighbors;
+    new_neighbors.reserve(R); 
+    
     for (const auto& cand_star : current_candidates) {
         if (new_neighbors.size() >= R) break;
         bool ok = true;
@@ -182,41 +210,46 @@ void VamanaIndex::robust_prune(uint32_t p, std::vector<Candidate>& candidates, f
         }
         if (ok) new_neighbors.push_back(cand_star.second);
     }
-    graph_[p] = new_neighbors;
+    
+    graph_[p].clear();
+    graph_[p].insert(graph_[p].end(), new_neighbors.begin(), new_neighbors.end());
 }
 
 void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L, float alpha, float gamma) {
-    // 1. Load Data
     FloatMatrix mat = load_fbin(data_path);
     npts_ = mat.npts; 
     dim_ = mat.dims; 
     
-    // Release from unique_ptr to the class member
-    data_ = mat.data.release(); 
-    owns_data_ = true;
-
-    Timer construction_timer;
-
-    // 2. Setup optimizations
-    start_node_ = calculate_medoid();
-    quantize_data(); // Creates u8_data_ for saving, but keeps data_ valid
-
-    // 3. Initialize Graph
-    graph_.assign(npts_, std::vector<uint32_t>());
-    locks_ = std::vector<std::mutex>(npts_);
+    auto safe_data_ptr = std::move(mat.data);
+    data_ = safe_data_ptr.get();
+    owns_data_ = false; 
     
+    Timer construction_timer;
+    start_node_ = calculate_medoid();
+    
+    uint32_t gamma_R = static_cast<uint32_t>(gamma * R);
+    
+    graph_.clear();
+    graph_.resize(npts_);
     std::mt19937 rng(42);
+    
     for (uint32_t i = 0; i < npts_; i++) {
+        graph_[i].reserve(gamma_R + 2); 
         for (uint32_t j = 0; j < R; j++) {
             uint32_t neighbor = rng() % npts_;
             if (neighbor != i) graph_[i].push_back(neighbor);
         }
     }
 
-    // 4. Refinement (CRITICAL: Uses greedy_search which requires float data_)
+    int max_threads = 1;
+#ifdef _OPENMP
+    max_threads = omp_get_max_threads();
+#endif
+    thread_buffers_.resize(max_threads);
+    locks_.reset(new std::mutex[npts_]);
+    
     std::cout << "  Refining graph edges..." << std::endl;
-    uint32_t gamma_R = static_cast<uint32_t>(gamma * R);
-
+    
     #pragma omp parallel for schedule(dynamic, 64)
     for (uint32_t i = 0; i < npts_; i++) {
         auto [candidates, cmps] = greedy_search(get_vector(i), L);
@@ -239,25 +272,14 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L, fl
     std::cout << "  Construction Time: " << construction_timer.elapsed_seconds() << "s" << std::endl;
 }
 
-SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L) const {
-    Timer t;
-    std::vector<uint8_t> q_u8(dim_);
-    for(uint32_t i=0; i<dim_; i++) q_u8[i] = (uint8_t)std::clamp((int)query[i], 0, 255);
-    
-    auto [candidates, dist_cmps] = greedy_search_u8(q_u8.data(), L);
-    
-    SearchResult result;
-    result.dist_cmps = dist_cmps; result.latency_us = t.elapsed_us();
-    for (uint32_t i = 0; i < K && i < candidates.size(); i++) result.ids.push_back(candidates[i].second);
-    return result;
-}
-
 // ============================================================================
 // IO Operations
 // ============================================================================
 void VamanaIndex::save(const std::string& path) const {
     std::ofstream out(path, std::ios::binary);
-    out.write((char*)&npts_, 4); out.write((char*)&dim_, 4); out.write((char*)&start_node_, 4);
+    out.write((char*)&npts_, 4); 
+    out.write((char*)&dim_, 4); 
+    out.write((char*)&start_node_, 4);
     for (uint32_t i = 0; i < npts_; i++) {
         uint32_t size = (uint32_t)graph_[i].size();
         out.write((char*)&size, 4); 
@@ -265,52 +287,62 @@ void VamanaIndex::save(const std::string& path) const {
     }
 }
 
-void VamanaIndex::load(const std::string& index_path, const std::string& data_path) {
-    try {
-        std::cout << "Loading base data for quantization..." << std::endl;
-        
-        // 1. Load float data
-        FloatMatrix mat = load_fbin(data_path);
-        npts_ = mat.npts; 
-        dim_ = mat.dims;
-        
-        // Use 'auto' to capture the specific unique_ptr type and deleter
-        auto temp_data = std::move(mat.data);
-        data_ = temp_data.get(); 
+void VamanaIndex::load_pq(const std::string& index_path, const std::string& codebook_path, const std::string& pq_data_path, const std::string& base_data_path) {
+    std::cout << "Loading PQ Codebook and Compressed Data..." << std::endl;
+    
+    std::ifstream in_cb(codebook_path, std::ios::binary);
+    if (!in_cb) throw std::runtime_error("Could not open codebook file!");
+    uint32_t f_dim;
+    in_cb.read((char*)&pq_M_, 4);
+    in_cb.read((char*)&f_dim, 4);
+    dim_ = f_dim;
+    pq_codebook_.resize(pq_M_ * 256 * (dim_ / pq_M_));
+    in_cb.read((char*)pq_codebook_.data(), pq_codebook_.size() * sizeof(float));
 
-        // 2. Quantize
-        quantize_data();
+    std::ifstream in_pq(pq_data_path, std::ios::binary);
+    if (!in_pq) throw std::runtime_error("Could not open pq compressed data!");
+    uint32_t f_npts, temp_m;
+    in_pq.read((char*)&f_npts, 4);
+    in_pq.read((char*)&temp_m, 4);
+    npts_ = f_npts;
+    pq_data_.resize(npts_ * pq_M_);
+    in_pq.read((char*)pq_data_.data(), pq_data_.size());
 
-        // 3. THE FIX: Drop the float data immediately
-        // Resetting the smart pointer triggers the correct custom deleter
-        temp_data.reset(); 
-        data_ = nullptr;
-        owns_data_ = false;
-        
-        std::cout << "  Float RAM freed. Loading index file..." << std::endl;
+    // NEW: Load the base data for the Stage-2 Re-ranker
+    std::cout << "Loading base data for SQ8 Re-ranker..." << std::endl;
+    FloatMatrix mat = load_fbin(base_data_path);
+    auto temp_data = std::move(mat.data);
+    data_ = temp_data.get(); 
+    quantize_data();
+    temp_data.reset(); // Drop the floats!
+    data_ = nullptr;
+    owns_data_ = false;
 
-        // 4. Load Index File
-        std::ifstream in(index_path, std::ios::binary);
-        if (!in) throw std::runtime_error("Could not open index file!");
+    std::cout << "Loading Vamana Graph..." << std::endl;
+    std::ifstream in_idx(index_path, std::ios::binary);
+    if (!in_idx) throw std::runtime_error("Could not open graph index file!");
+    
+    uint32_t dummy;
+    in_idx.read((char*)&dummy, 4); 
+    in_idx.read((char*)&dummy, 4); 
+    in_idx.read((char*)&start_node_, 4);
 
-        uint32_t f_npts, f_dim;
-        in.read((char*)&f_npts, 4);
-        in.read((char*)&f_dim, 4);
-        in.read((char*)&start_node_, 4);
-
-        graph_.clear();
-        graph_.resize(npts_); 
-
-        for (uint32_t i = 0; i < npts_; i++) {
-            uint32_t degree;
-            if (!in.read((char*)&degree, 4)) break;
-            graph_[i].resize(degree);
-            in.read((char*)graph_[i].data(), degree * sizeof(uint32_t));
-        }
-        std::cout << "  Index load successful!" << std::endl;
-
-    } catch (const std::exception& e) {
-        std::cerr << "\nSTABILITY ERROR: " << e.what() << std::endl;
-        std::exit(1);
+    graph_.clear();
+    graph_.resize(npts_); 
+    for (uint32_t i = 0; i < npts_; i++) {
+        uint32_t degree;
+        if (!in_idx.read((char*)&degree, 4)) break;
+        graph_[i].reserve(degree);
+        graph_[i].resize(degree);
+        in_idx.read((char*)graph_[i].data(), degree * sizeof(uint32_t));
     }
+    
+    int max_threads = 1;
+#ifdef _OPENMP
+    max_threads = omp_get_max_threads();
+#endif
+    thread_buffers_.resize(max_threads);
+    locks_ = nullptr; // Ensure locks are disabled for lock-free searching
+    
+    std::cout << "Two-Stage PQ Engine loaded successfully!" << std::endl;
 }

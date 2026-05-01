@@ -98,7 +98,7 @@ int main(int argc, char** argv) {
     // --- Load index ---
     std::cout << "Loading index..." << std::endl;
     VamanaIndex index;
-    index.load(index_path, data_path);
+    index.load_pq(index_path, "pq_codebook.bin", "pq_compressed.bin", data_path);
 
     // --- Load queries ---
     FloatMatrix queries = load_fbin(query_path);
