@@ -52,9 +52,14 @@ int main(int argc, char** argv) {
     std::cout << "  gamma = " << gamma << std::endl;
 
     VamanaIndex index;
-
     Timer total_timer;
+    
+    // We consolidate into a single, high-quality build pass.
+    // This pass now includes Medoid calculation, Single-Pass graph construction, 
+    // and SQ8 Quantization as the final step.
+    std::cout << "\n=== Building Vamana Index (Golden Configuration) ===\n";
     index.build(data_path, R, L, alpha, gamma);
+
     double total_time = total_timer.elapsed_seconds();
 
     std::cout << "\nTotal build time: " << total_time << " seconds" << std::endl;
